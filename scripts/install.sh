@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# CoT Translator one-line installer
-# Usage (latest):  curl -fsSL https://raw.githubusercontent.com/<GH_USER>/cot-translator/main/scripts/install.sh | sudo bash -s -- -r <GH_USER>/cot-translator -v latest -tak tak.example.org:8089 -udp 5010 -stale 120
-# Usage (with certs via base64):
-#   curl -fsSL https://raw.githubusercontent.com/<GH_USER>/cot-translator/main/scripts/install.sh | sudo bash -s -- \
-#   -r <GH_USER>/cot-translator -v latest -tak tak.example.org:8089 \
-#   -ca-b64 "$(base64 -w0 ca.pem)" -cert-b64 "$(base64 -w0 translator.pem)" -key-b64 "$(base64 -w0 translator.key)"
-
 set -euo pipefail
 
 REPO=""; VER="latest"; TAK_ADDR=""; UDP_PORT=5010; PSK=""; STALE=120; COT_TYPE="a-f-G-U-C"; HOW="m-g"
@@ -40,10 +33,10 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 CoT Translator installer
 Required:
-  -r, --repo        <user/repo>   (e.g., rupen/cot-translator)
+  -r, --repo        <user/repo>   (e.g., youruser/cot-translator)
 Recommended:
   -v, --version     <tag|latest>  (default: latest)
-  -tak, --tak-addr  <host:port>   TAK TLS Input address (e.g., tak.example.org:8089)
+  -tak, --tak-addr  <host:port>   TAK TLS Input (e.g., tak.example.org:8089)
 Optional:
   -udp, --udp-port  <port>        UDP ingest (default: 5010)
   -psk, --psk       <string>      Optional payload prefix filter
@@ -74,7 +67,7 @@ case "$arch" in
 esac
 
 if [[ "$VER" == "latest" ]]; then
-  log "Resolving latest release tag from GitHub…"
+  log "Resolving latest release tag…"
   VER="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -m1 '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')" || true
   [[ -n "$VER" ]] || die "Could not resolve latest tag; pass -v <tag>"
 fi
@@ -92,18 +85,9 @@ chmod +x "${BIN_PATH}"
 chown "$SERVICE_USER":"$SERVICE_USER" "${BIN_PATH}"
 
 # Write certs if provided
-write_if_b64(){
-  local b64="$1" dst="$2"
-  [[ -z "$b64" ]] && return 0
-  printf "%s" "$b64" | base64 -d > "$dst"
-  chmod 0400 "$dst"; chown "$SERVICE_USER":"$SERVICE_USER" "$dst"
-}
-copy_if_file(){
-  local src="$1" dst="$2"
-  [[ -z "$src" ]] && return 0
-  cp "$src" "$dst"
-  chmod 0400 "$dst"; chown "$SERVICE_USER":"$SERVICE_USER" "$dst"
-}
+write_if_b64(){ [[ -z "$1" ]] && return 0; printf "%s" "$1" | base64 -d > "$2"; chmod 0400 "$2"; chown "$SERVICE_USER":"$SERVICE_USER" "$2"; }
+copy_if_file(){ [[ -z "$1" ]] && return 0; cp "$1" "$2"; chmod 0400 "$2"; chown "$SERVICE_USER":"$SERVICE_USER" "$2"; }
+
 write_if_b64 "$CA_B64"   "${INSTALL_DIR}/ca.pem"
 write_if_b64 "$CERT_B64" "${INSTALL_DIR}/translator.pem"
 write_if_b64 "$KEY_B64"  "${INSTALL_DIR}/translator.key"
@@ -112,8 +96,8 @@ copy_if_file  "$CERT_FILE" "${INSTALL_DIR}/translator.pem"
 copy_if_file  "$KEY_FILE"  "${INSTALL_DIR}/translator.key"
 
 # Env file
-log "Writing ${ENV_FILE}…"
-cat > "$ENV_FILE" <<EOF
+log "Writing /etc/default/cot-translator…"
+cat > "/etc/default/cot-translator" <<EOF
 IN_UDP_PORT=${UDP_PORT}
 IN_PSK=${PSK}
 COT_TYPE=${COT_TYPE}
@@ -126,16 +110,15 @@ TAK_CLIENT_CERT=${INSTALL_DIR}/translator.pem
 TAK_CLIENT_KEY=${INSTALL_DIR}/translator.key
 TAK_TLS_INSECURE=false
 EOF
-chmod 0644 "$ENV_FILE"
+chmod 0644 "/etc/default/cot-translator"
 
-# systemd unit (uses EnvironmentFile for easy updates)
+# systemd unit
 log "Installing systemd unit…"
 cat > "$UNIT_FILE" <<'EOF'
 [Unit]
 Description=CoT Translator (GPGGA UDP -> CoT -> TAK TLS)
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 User=cot
 Group=cot
@@ -151,21 +134,19 @@ PrivateTmp=true
 PrivateDevices=true
 MemoryMax=150M
 LimitNOFILE=65535
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
 
-# Start only if TAK_ADDR is set
 if [[ -n "$TAK_ADDR" ]]; then
   log "Enabling & starting service…"
   systemctl enable --now cot-translator
   systemctl --no-pager status cot-translator || true
   log "Follow logs:  journalctl -u cot-translator -f"
 else
-  log "Installed. Set TAK_TLS_ADDR in ${ENV_FILE}, then: systemctl enable --now cot-translator"
+  log "Installed. Set TAK_TLS_ADDR in /etc/default/cot-translator, then: systemctl enable --now cot-translator"
 fi
 
 log "Done."
