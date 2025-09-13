@@ -7,21 +7,8 @@ Wants=network-online.target
 User=cot
 Group=cot
 WorkingDirectory=/opt/cot
+EnvironmentFile=-/etc/default/cot-translator
 ExecStart=/opt/cot/cot-translator
-Environment=IN_UDP_PORT=5010
-Environment=IN_PSK=
-Environment=COT_TYPE=a-f-G-U-C
-Environment=STALE_SECS=120
-Environment=COT_HOW=m-g
-
-# ---- Direct to TAK TLS Input ----
-Environment=OUT_TAK_TLS_ENABLE=true
-Environment=TAK_TLS_ADDR=tak.example.org:8089
-Environment=TAK_CA_CERT=/opt/cot/ca.pem
-Environment=TAK_CLIENT_CERT=/opt/cot/translator.pem
-Environment=TAK_CLIENT_KEY=/opt/cot/translator.key
-Environment=TAK_TLS_INSECURE=false
-
 Restart=always
 RestartSec=1
 NoNewPrivileges=yes
