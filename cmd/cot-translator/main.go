@@ -39,10 +39,10 @@ type Config struct {
 	CACertPem     string
 	TLSInsecure   bool
 
-	// TCP server (for TAK SDF to connect; optional)
+	// TCP server (optional SDF pull)
 	TCPListen string
 
-	// UDP publisher (for TAK SDF to subscribe; optional)
+	// UDP publisher (optional SDF UDP)
 	OutUDPAddr string
 	OutUDPPort int
 }
@@ -55,14 +55,12 @@ func envInt(key string, def int) int {
 	}
 	return def
 }
-
 func envBool(key string, def bool) bool {
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv(key))); v != "" {
 		return v == "1" || v == "true" || v == "yes" || v == "on"
 	}
 	return def
 }
-
 func defaultStr(s, d string) string {
 	if strings.TrimSpace(s) == "" {
 		return d
@@ -79,14 +77,14 @@ func loadConfig() Config {
 		StaleSecs: envInt("STALE_SECS", 120),
 		How:       defaultStr(os.Getenv("COT_HOW"), "m-g"),
 
-		EnableTLSClient: envBool("OUT_TAK_TLS_ENABLE", false),
-		EnableTCPServer: envBool("OUT_TCP_SERVER_ENABLE", true),
+		EnableTLSClient: envBool("OUT_TAK_TLS_ENABLE", true),
+		EnableTCPServer: envBool("OUT_TCP_SERVER_ENABLE", false),
 		EnableUDPPub:    envBool("OUT_UDP_ENABLE", false),
 
-		TlsAddr:       os.Getenv("TAK_TLS_ADDR"),    // host:port
-		ClientCertPem: os.Getenv("TAK_CLIENT_CERT"), // path
-		ClientKeyPem:  os.Getenv("TAK_CLIENT_KEY"),  // path
-		CACertPem:     os.Getenv("TAK_CA_CERT"),     // path
+		TlsAddr:       os.Getenv("TAK_TLS_ADDR"),
+		ClientCertPem: os.Getenv("TAK_CLIENT_CERT"),
+		ClientKeyPem:  os.Getenv("TAK_CLIENT_KEY"),
+		CACertPem:     os.Getenv("TAK_CA_CERT"),
 		TLSInsecure:   envBool("TAK_TLS_INSECURE", false),
 
 		TCPListen: defaultStr(os.Getenv("TCP_LISTEN"), ":8087"),
@@ -102,7 +100,7 @@ type Fix struct {
 	DeviceID string
 	Lat      float64
 	Lon      float64
-	HAE      float64 // meters (HAE)
+	HAE      float64 // meters
 	Time     time.Time
 	Valid    bool
 }
@@ -112,15 +110,11 @@ func parseGPGGA(line string) (Fix, error) {
 	if !strings.HasPrefix(orig, "$GPGGA") {
 		return Fix{}, fmt.Errorf("not GPGGA")
 	}
-	// Split checksum
 	body := orig
 	if i := strings.Index(orig, "*"); i > 0 {
-		body = orig[:i]
-		// checksum is ignored or warned elsewhere if desired
+		body = orig[:i] // checksum ignored (some devices omit/incorrect)
 	}
-
 	parts := strings.Split(body, ",")
-	// Expected fields per NMEA GGA:
 	// 0:$GPGGA 1:utc 2:lat 3:N/S 4:lon 5:E/W 6:fix 7:sats 8:hdop 9:alt 10:M 11:geoid 12:M 13:age 14:stationID(DEVICEID)
 	if len(parts) < 6 {
 		return Fix{}, fmt.Errorf("too few fields")
@@ -140,20 +134,17 @@ func parseGPGGA(line string) (Fix, error) {
 	if len(parts) >= 15 {
 		deviceID = strings.TrimSpace(parts[14])
 	}
-	// Fallback: if last field is empty but there are 15 fields, try previous non-empty tail
 	if deviceID == "" {
+		// Fallback to last non-empty field (helps with quirky devices)
 		for i := len(parts) - 1; i >= 0; i-- {
-			if strings.TrimSpace(parts[i]) != "" && !strings.HasPrefix(parts[i], "$GPGGA") {
-				deviceID = strings.TrimSpace(parts[i])
+			if s := strings.TrimSpace(parts[i]); s != "" && !strings.HasPrefix(s, "$GPGGA") {
+				deviceID = s
 				break
 			}
 		}
 	}
 
-	fixValid := false
-	if len(parts) > 6 && parts[6] != "" {
-		fixValid = parts[6] != "0"
-	}
+	fixValid := (len(parts) > 6 && parts[6] != "" && parts[6] != "0")
 
 	return Fix{
 		DeviceID: deviceID,
@@ -185,7 +176,6 @@ func parseLat(parts []string, iVal, iHem int) float64 {
 	}
 	return out
 }
-
 func parseLon(parts []string, iVal, iHem int) float64 {
 	if len(parts) <= iVal || len(parts) <= iHem {
 		return 0
@@ -214,17 +204,13 @@ type lastState struct {
 	Lon  float64
 	Time time.Time
 }
-
 type tracker struct {
 	mu   sync.Mutex
 	prev map[string]lastState
 }
+func newTracker() *tracker { return &tracker{prev: make(map[string]lastState)} }
 
-func newTracker() *tracker {
-	return &tracker{prev: make(map[string]lastState)}
-}
-
-func (t *tracker) speedCourse(f Fix) (speedMS float64, courseDeg float64, have bool) {
+func (t *tracker) speedCourse(f Fix) (speedMS, courseDeg float64, have bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	prev, ok := t.prev[f.DeviceID]
@@ -252,7 +238,6 @@ func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
 	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 	return R * c
 }
-
 func bearing(lat1, lon1, lat2, lon2 float64) float64 {
 	rad := math.Pi / 180.0
 	φ1 := lat1 * rad
@@ -272,6 +257,7 @@ func bearing(lat1, lon1, lat2, lon2 float64) float64 {
 func buildCoT(cfg Config, f Fix, speedMS, courseDeg float64) []byte {
 	now := f.Time.UTC()
 	stale := now.Add(time.Duration(cfg.StaleSecs) * time.Second)
+
 	uid := xmlEscape(nonEmpty(f.DeviceID, fmt.Sprintf("device-%d", time.Now().UnixNano())))
 	callsign := uid
 
@@ -315,13 +301,12 @@ type output interface {
 	Close() error
 }
 
-// UDP publisher (unicast or multicast)
+// UDP publisher (optional)
 type udpOut struct {
 	addr *net.UDPAddr
 	conn *net.UDPConn
 	mu   sync.Mutex
 }
-
 func newUDPOut(addr string, port int) (*udpOut, error) {
 	a, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", addr, port))
 	if err != nil {
@@ -333,14 +318,10 @@ func newUDPOut(addr string, port int) (*udpOut, error) {
 	}
 	return &udpOut{addr: a, conn: conn}, nil
 }
-func (o *udpOut) Send(b []byte) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	_, _ = o.conn.Write(b)
-}
-func (o *udpOut) Close() error { return o.conn.Close() }
+func (o *udpOut) Send(b []byte) { o.mu.Lock(); defer o.mu.Unlock(); _, _ = o.conn.Write(b) }
+func (o *udpOut) Close() error  { return o.conn.Close() }
 
-// TCP server (multiple TAK connections)
+// TCP server (optional)
 type tcpServerOut struct {
 	listen string
 	ln     net.Listener
@@ -348,7 +329,6 @@ type tcpServerOut struct {
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
 }
-
 func newTCPServerOut(listen string) (*tcpServerOut, error) {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
@@ -370,51 +350,34 @@ func (o *tcpServerOut) acceptLoop() {
 			log.Printf("[out tcp] accept error: %v", err)
 			return
 		}
-		o.mu.Lock()
-		o.conns[c] = struct{}{}
-		o.mu.Unlock()
+		o.mu.Lock(); o.conns[c] = struct{}{}; o.mu.Unlock()
 		go o.serve(c)
 	}
 }
 func (o *tcpServerOut) serve(c net.Conn) {
-	defer func() {
-		o.mu.Lock()
-		delete(o.conns, c)
-		o.mu.Unlock()
-		_ = c.Close()
-	}()
+	defer func() { o.mu.Lock(); delete(o.conns, c); o.mu.Unlock(); _ = c.Close() }()
 	reader := bufio.NewReader(c)
 	for {
-		// just keep connection alive; discard
 		_ = c.SetReadDeadline(time.Now().Add(10 * time.Minute))
 		if _, err := reader.ReadByte(); err != nil {
-			if err != io.EOF {
-				log.Printf("[out tcp] conn closed: %v", err)
-			}
+			if err != io.EOF { log.Printf("[out tcp] conn closed: %v", err) }
 			return
 		}
 	}
 }
 func (o *tcpServerOut) Send(b []byte) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.mu.Lock(); defer o.mu.Unlock()
 	for c := range o.conns {
 		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		if _, err := c.Write(b); err != nil {
-			_ = c.Close()
-			delete(o.conns, c)
+			_ = c.Close(); delete(o.conns, c)
 		}
 	}
 }
 func (o *tcpServerOut) Close() error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	for c := range o.conns {
-		_ = c.Close()
-	}
-	if o.ln != nil {
-		return o.ln.Close()
-	}
+	o.mu.Lock(); defer o.mu.Unlock()
+	for c := range o.conns { _ = c.Close() }
+	if o.ln != nil { return o.ln.Close() }
 	return nil
 }
 
@@ -426,23 +389,18 @@ type tlsClientOut struct {
 	mu   sync.Mutex
 	conn *tls.Conn
 }
-
 func newTLSClientOut(addr, caPath, certPath, keyPath string, insecure bool) (*tlsClientOut, error) {
-	cfg := &tls.Config{InsecureSkipVerify: insecure} // (set false in prod)
+	cfg := &tls.Config{InsecureSkipVerify: insecure} // set false in prod
 	if caPath != "" {
 		caPEM, err := os.ReadFile(caPath)
-		if err != nil {
-			return nil, err
-		}
+		if err != nil { return nil, err }
 		cp := x509.NewCertPool()
 		cp.AppendCertsFromPEM(caPEM)
 		cfg.RootCAs = cp
 	}
 	if certPath != "" && keyPath != "" {
 		crt, err := tls.LoadX509KeyPair(certPath, keyPath)
-		if err != nil {
-			return nil, err
-		}
+		if err != nil { return nil, err }
 		cfg.Certificates = []tls.Certificate{crt}
 	}
 	o := &tlsClientOut{addr: addr, tlsConfig: cfg}
@@ -454,51 +412,36 @@ func (o *tlsClientOut) connectLoop() {
 		conn, err := tls.Dial("tcp", o.addr, o.tlsConfig)
 		if err != nil {
 			log.Printf("[out tls] dial failed: %v (retrying)", err)
-			time.Sleep(2 * time.Second)
-			continue
+			time.Sleep(2 * time.Second); continue
 		}
 		log.Printf("[out tls] connected %s", o.addr)
-		o.mu.Lock()
-		o.conn = conn
-		o.mu.Unlock()
+		o.mu.Lock(); o.conn = conn; o.mu.Unlock()
 
-		// Keepalive: wait until remote closes
 		buf := make([]byte, 1)
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Minute))
-		_, err = conn.Read(buf)
+		_, err = conn.Read(buf) // block until closed
 		log.Printf("[out tls] conn closed: %v", err)
 
-		o.mu.Lock()
-		_ = o.conn.Close()
-		o.conn = nil
-		o.mu.Unlock()
-
+		o.mu.Lock(); _ = o.conn.Close(); o.conn = nil; o.mu.Unlock()
 		time.Sleep(1 * time.Second)
 	}
 }
 func (o *tlsClientOut) Send(b []byte) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.conn == nil {
-		return
-	}
+	o.mu.Lock(); defer o.mu.Unlock()
+	if o.conn == nil { return }
 	_ = o.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := o.conn.Write(b); err != nil {
 		log.Printf("[out tls] write error: %v", err)
-		_ = o.conn.Close()
-		o.conn = nil
+		_ = o.conn.Close(); o.conn = nil
 	}
 }
 func (o *tlsClientOut) Close() error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.conn != nil {
-		return o.conn.Close()
-	}
+	o.mu.Lock(); defer o.mu.Unlock()
+	if o.conn != nil { return o.conn.Close() }
 	return nil
 }
 
-// ------------ Main pipeline ------------
+// ------------ Main ------------
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -506,65 +449,39 @@ func main() {
 	log.Printf("[boot] CoT Translator starting. UDP in :%d  TLS:%v TCP:%v UDPout:%v",
 		cfg.InUDPPort, cfg.EnableTLSClient, cfg.EnableTCPServer, cfg.EnableUDPPub)
 
-	// Build outputs
 	outs := []output{}
 	if cfg.EnableUDPPub {
-		u, err := newUDPOut(cfg.OutUDPAddr, cfg.OutUDPPort)
-		if err != nil {
-			log.Fatalf("udp out: %v", err)
-		}
+		u, err := newUDPOut(cfg.OutUDPAddr, cfg.OutUDPPort); if err != nil { log.Fatalf("udp out: %v", err) }
 		outs = append(outs, u)
 	}
 	if cfg.EnableTCPServer {
-		t, err := newTCPServerOut(cfg.TCPListen)
-		if err != nil {
-			log.Fatalf("tcp server out: %v", err)
-		}
+		t, err := newTCPServerOut(cfg.TCPListen); if err != nil { log.Fatalf("tcp server out: %v", err) }
 		outs = append(outs, t)
 	}
 	if cfg.EnableTLSClient {
-		if cfg.TlsAddr == "" {
-			log.Fatalf("OUT_TAK_TLS_ENABLE=1 but TAK_TLS_ADDR unset")
-		}
+		if cfg.TlsAddr == "" { log.Fatalf("OUT_TAK_TLS_ENABLE=1 but TAK_TLS_ADDR unset") }
 		tlsOut, err := newTLSClientOut(cfg.TlsAddr, cfg.CACertPem, cfg.ClientCertPem, cfg.ClientKeyPem, cfg.TLSInsecure)
-		if err != nil {
-			log.Fatalf("tls out: %v", err)
-		}
+		if err != nil { log.Fatalf("tls out: %v", err) }
 		outs = append(outs, tlsOut)
 	}
 
 	incoming := make(chan string, 1024)
 	trk := newTracker()
 
-	// UDP listener
-	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%d", cfg.InUDPPort))
-	if err != nil {
-		log.Fatalf("udp resolve: %v", err)
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Fatalf("udp listen: %v", err)
-	}
+	// UDP listen
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%d", cfg.InUDPPort)); if err != nil { log.Fatalf("udp resolve: %v", err) }
+	udpConn, err := net.ListenUDP("udp", udpAddr); if err != nil { log.Fatalf("udp listen: %v", err) }
 	defer udpConn.Close()
 	go func() {
 		buf := make([]byte, 2048)
 		for {
 			n, addr, err := udpConn.ReadFromUDP(buf)
-			if err != nil {
-				log.Printf("[in udp] read error: %v", err)
-				continue
-			}
+			if err != nil { log.Printf("[in udp] read error: %v", err); continue }
 			line := strings.TrimSpace(string(buf[:n]))
-			if cfg.PSK != "" && !strings.HasPrefix(line, cfg.PSK) {
-				continue // drop non-matching
-			}
-			if cfg.PSK != "" {
-				line = strings.TrimPrefix(line, cfg.PSK)
-			}
+			if cfg.PSK != "" && !strings.HasPrefix(line, cfg.PSK) { continue }
+			if cfg.PSK != "" { line = strings.TrimPrefix(line, cfg.PSK) }
 			incoming <- line
-			if (time.Now().Unix()%30) == 0 {
-				log.Printf("[in udp] %d bytes from %s", n, addr)
-			}
+			if (time.Now().Unix()%30) == 0 { log.Printf("[in udp] %d bytes from %s", n, addr) }
 		}
 	}()
 
@@ -577,27 +494,18 @@ func main() {
 			}
 			speed, course, _ := trk.speedCourse(fix)
 			xml := buildCoT(cfg, fix, speed, course)
-			for _, o := range outs {
-				o.Send(xml)
-			}
+			for _, o := range outs { o.Send(xml) }
 		}
 	}()
 
 	// Health log
 	go func() {
-		t := time.NewTicker(60 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			log.Printf("[health] running; outs=%d", len(outs))
-		}
+		t := time.NewTicker(60 * time.Second); defer t.Stop()
+		for range t.C { log.Printf("[health] running; outs=%d", len(outs)) }
 	}()
 
 	// Shutdown
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	for _, o := range outs {
-		_ = o.Close()
-	}
+	sig := make(chan os.Signal, 1); signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM); <-sig
+	for _, o := range outs { _ = o.Close() }
 	log.Printf("[exit] bye")
 }
