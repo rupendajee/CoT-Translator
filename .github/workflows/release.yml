@@ -1,0 +1,27 @@
+name: release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Build linux/amd64
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o cot-translator_linux_amd64 ./cmd/cot-translator
+      - name: Build linux/arm64
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o cot-translator_linux_arm64 ./cmd/cot-translator
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cot-translator-binaries
+          path: |
+            cot-translator_linux_amd64
+            cot-translator_linux_arm64
