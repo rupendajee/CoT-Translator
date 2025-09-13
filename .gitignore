@@ -1,13 +1,10 @@
-# artifacts
 cot-translator
 *.pem
 *.key
 *.crt
 *.der
 *.p12
-# deps
 vendor/
-# editor
 .idea/
 .vscode/
 .DS_Store
